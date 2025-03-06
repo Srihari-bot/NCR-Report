@@ -6,3 +6,9 @@ python-dotenv
 urllib3
 certifi
 logging
+pandas
+xlsxwriter
+streamlit
+requests
+beautifulsoup4
+python-dotenv
