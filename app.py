@@ -1,4 +1,6 @@
 
+
+
 import streamlit as st
 import requests
 import json
@@ -13,7 +15,6 @@ import logging
 import os
 from dotenv import load_dotenv
 import io
-
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -133,7 +134,7 @@ def process_json_data(json_data):
     data = []
     for item in json_data:
         form_details = item.get('FormDetails', {})
-        close_due = form_details.get('CloseDue', None)
+        close_due = form_details.get('FormCreationDate', None)
         update_date = form_details.get('UpdateDate', None)
         form_status = form_details.get('FormStatus', None)
         
@@ -151,7 +152,7 @@ def process_json_data(json_data):
             try:
                 update_date_obj = datetime.strptime(update_date.split('#')[0], "%d-%b-%Y")
                 close_due_obj = datetime.strptime(close_due.split('#')[0], "%d-%b-%Y")
-                days_diff = (close_due_obj - update_date_obj).days
+                days_diff = abs((close_due_obj - update_date_obj).days)  # Use absolute value
             except:
                 days_diff = None
 
@@ -163,9 +164,9 @@ def process_json_data(json_data):
     return df
 
 # Generate NCR Report
+
 def generate_ncr_report(df, report_type, start_date=None, end_date=None):
     with st.spinner(f"Generating {report_type} NCR Report..."):
-        # Data filtering remains the same...
         if report_type == "Closed":
             filtered_df = df[
                 (df['Status'] == 'Closed') &
@@ -174,11 +175,15 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
                 (abs(df['Days']) > 21)  # Filter for absolute Days > 21
             ]
         else:  # Open
+            # Filter for records that are open as of the end_date (Open Until Date)
             filtered_df = df[
                 (df['Status'] == 'Open') &
-                (df['UpdateDate'] <= pd.to_datetime(end_date)) &
-                (df['CloseDue'].isna() | (df['CloseDue'] > pd.to_datetime(end_date)))
+                (df['UpdateDate'] <= pd.to_datetime(end_date))  # Ensure the record was opened on or before the Open Until Date
             ]
+            # Calculate how many days the record has been open (from UpdateDate to end_date)
+            filtered_df['DaysOpen'] = (pd.to_datetime(end_date) - filtered_df['UpdateDate']).dt.days
+            # Filter for records that have been open for more than 21 days
+            filtered_df = filtered_df[filtered_df['DaysOpen'] > 21]
 
         if filtered_df.empty:
             return {"error": f"No {report_type} records found"}, ""
@@ -188,132 +193,186 @@ def generate_ncr_report(df, report_type, start_date=None, end_date=None):
         filtered_df['CloseDue'] = filtered_df['CloseDue'].astype(str) if 'CloseDue' in filtered_df else filtered_df['CloseDue']
 
         processed_data = filtered_df.to_dict(orient="records")
+        
+        # Loop through the data to check and format it
+        cleaned_data = []
         for record in processed_data:
-            description = record.get("Description", "")
+            # Ensure required fields exist and handle missing or malformed data
+            cleaned_record = {
+                "Description": str(record.get("Description", "")),
+                "Discipline": str(record.get("Discipline", "")),
+                "UpdateDate": str(record.get("UpdateDate", "")),
+                "CloseDue": str(record.get("CloseDue", "")),
+                "Status": str(record.get("Status", ""))
+            }
+
+            # Extract Tower from Description and normalize it
+            description = cleaned_record["Description"]
             if description:
-                # Updated regex to match Tower - X, T-X, T X, Tower-X, etc. (case-insensitive)
-                tower_match = re.search(r"(Tower|T)\s*-?\s*\d+", description, re.IGNORECASE)
-                record["Tower"] = tower_match.group(0) if tower_match else "Unknown"
+                tower_match = re.search(r"(Tower|T)\s*-?\s*(\d+)", description, re.IGNORECASE)
+                if tower_match:
+                    tower_prefix = "Tower"  # Standardize prefix
+                    tower_number = tower_match.group(2)  # Extract the number
+                    # Pad the number with leading zeros to make it two digits (e.g., "01", "07")
+                    tower_number_padded = tower_number.zfill(2)
+                    cleaned_record["Tower"] = f"{tower_prefix}-{tower_number_padded}"
+                else:
+                    cleaned_record["Tower"] = "External Development"  # Replace Unknown with External Development
             else:
-                record["Tower"] = "Unknown"
+                cleaned_record["Tower"] = "External Development"  # Replace Unknown with External Development
 
             # Categorize discipline into SW, FW, or MEP
-            discipline = record.get("Discipline", "").strip().lower()
+            discipline = cleaned_record["Discipline"].strip().lower()
             if "structure" in discipline or "sw" in discipline:
-                record["Discipline_Category"] = "SW"
+                cleaned_record["Discipline_Category"] = "SW"
             elif "civil" in discipline or "finishing" in discipline or "fw" in discipline:
-                record["Discipline_Category"] = "FW"
+                cleaned_record["Discipline_Category"] = "FW"
             else:
-                record["Discipline_Category"] = "MEP"
+                cleaned_record["Discipline_Category"] = "MEP"
 
-        # IMPROVED PROMPT: More forceful, includes example
-        prompt = (
-            "IMPORTANT: YOU MUST RETURN ONLY VALID JSON. DO NOT INCLUDE ANY TEXT, EXPLANATION, OR NOTES.\n\n"
-            f"Task: For {report_type} NCRs, count records by site ('Tower' field) and discipline category ('Discipline_Category' field).\n"
-            f"Condition for {report_type} NCRs: {'absolute value of Days > 21' if report_type == 'Closed' else 'still open beyond the end date'}.\n"
-            "Use exact 'Tower' values from data; keep 'Unknown' as is.\n\n"
-            "REQUIRED OUTPUT FORMAT (exactly this structure with actual counts):\n"
-            "{\n"
-            f'  "{report_type}": {{\n'
-            '    "Sites": {\n'
-            '      "Site_Name1": {\n'
-            '        "SW": number,\n'
-            '        "FW": number,\n'
-            '        "MEP": number,\n'
-            '        "Total": number\n'
-            '      },\n'
-            '      "Site_Name2": {\n'
-            '        "SW": number,\n'
-            '        "FW": number,\n'
-            '        "MEP": number,\n'
-            '        "Total": number\n'
-            '      }\n'
-            '    },\n'
-            '    "Grand_Total": number\n'
-            '  }\n'
-            '}\n\n'
-            f"Data: {json.dumps(processed_data[:100])}\n"  # Limit data to first 100 records to avoid token limits
-        )
+            cleaned_data.append(cleaned_record)
+
+        # Debug: Log the total number of records being processed
+        st.write(f"Debug - Total {report_type} records to process: {len(cleaned_data)}")
 
         # Get access token
         access_token = get_access_token(API_KEY)
         if not access_token:
             return {"error": "Failed to obtain access token"}, ""
 
-        payload = {
-            "input": prompt,
-            "parameters": {
-                "decoding_method": "greedy",
-                "max_new_tokens": 4000,  # Further reduced to ensure we stay well within limits
-                "min_new_tokens": 0,
-                "temperature": 0.01  # Set temperature even lower for stricter output
-            },
-            "model_id": MODEL_ID,
-            "project_id": PROJECT_ID
+        # WatsonX has token limits, so we'll process the data in chunks if necessary
+        chunk_size = 200  # Adjust this based on WatsonX token limits (experiment to find the optimal size)
+        all_results = {
+            report_type: {
+                "Sites": {},
+                "Grand_Total": 0
+            }
         }
 
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {access_token}"
-        }
+        for i in range(0, len(cleaned_data), chunk_size):
+            chunk = cleaned_data[i:i + chunk_size]
+            st.write(f"Processing chunk {i // chunk_size + 1}: Records {i} to {min(i + chunk_size, len(cleaned_data))}")
 
-        try:
-            response = requests.post(WATSONX_API_URL, headers=headers, json=payload, timeout=50)
-            logger.info(f"WatsonX API response status code: {response.status_code}")
-            st.write(f"Debug - Response status code: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                generated_text = result.get("results", [{}])[0].get("generated_text", "").strip()
-                st.write(f"Debug - Raw response: {generated_text}")
-                
-                if generated_text:
-                    # Extract JSON using regex to handle any potential non-JSON content
-                    json_match = re.search(r'({[\s\S]*})', generated_text)
-                    
-                    if json_match:
-                        json_str = json_match.group(1)
-                        try:
-                            parsed_json = json.loads(json_str)
-                            return parsed_json, json_str
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSONDecodeError: {str(e)} - Raw response: {generated_text}")
-                            st.error(f"❌ Failed to parse JSON: {str(e)}")
-                            
-                            # Create default output format for failed parsing
-                            default_json = {
-                                f"{report_type}": {
-                                    "Sites": {},
-                                    "Grand_Total": 0
-                                }
-                            }
+            # Debug: Log the chunk data to inspect Tower values
+            logger.debug(f"Chunk data: {json.dumps(chunk, indent=2)}")
+
+            # Create the prompt for this chunk
+            prompt = (
+                "IMPORTANT: YOU MUST RETURN ONLY VALID JSON. DO NOT INCLUDE ANY TEXT, EXPLANATION, OR NOTES.\n\n"
+                f"Task: For {report_type} NCRs, count records by site ('Tower' field) and discipline category ('Discipline_Category' field).\n"
+                f"Condition for {report_type} NCRs: {'absolute value of Days > 21' if report_type == 'Closed' else 'open more than 21 days as of the specified end_date'}.\n"
+                "Use exact 'Tower' values from data; keep 'External Development' or 'Veridia-Commercial' as is for non-matching cases.\n\n"
+                "REQUIRED OUTPUT FORMAT (exactly this structure with actual counts):\n"
+                "{\n"
+                f'  "{report_type}": {{\n'
+                '    "Sites": {\n'
+                '      "Site_Name1": {\n'
+                '        "SW": number,\n'
+                '        "FW": number,\n'
+                '        "MEP": number,\n'
+                '        "Total": number\n'
+                '      },\n'
+                '      "Site_Name2": {\n'
+                '        "SW": number,\n'
+                '        "FW": number,\n'
+                '        "MEP": number,\n'
+                '        "Total": number\n'
+                '      }\n'
+                '    },\n'
+                '    "Grand_Total": number\n'
+                '  }\n'
+                '}\n\n'
+                f"Data: {json.dumps(chunk)}\n"  # Send the current chunk of data
+                f"Return the result strictly as a JSON object—no code, no explanations, no string literal like this ```, only the JSON."
+            )
+
+            payload = {
+                "input": prompt,
+                "parameters": {
+                    "decoding_method": "greedy",
+                    "max_new_tokens": 8100,
+                    "min_new_tokens": 0,
+                    "temperature": 0.01
+                },
+                "model_id": MODEL_ID,
+                "project_id": PROJECT_ID
+            }
+
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            try:
+                response = requests.post(WATSONX_API_URL, headers=headers, json=payload, timeout=500)
+                logger.info(f"WatsonX API response status code: {response.status_code}")
+                st.write(f"Debug - Response status code: {response.status_code}")
+
+                if response.status_code == 200:
+                    result = response.json()
+                    generated_text = result.get("results", [{}])[0].get("generated_text", "").strip()
+                    st.write(f"Debug - Raw response: {generated_text}")
+
+                    if generated_text:
+                        # Extract JSON using regex to handle any potential non-JSON content
+                        json_match = re.search(r'({[\s\S]*})', generated_text)
+
+                        if json_match:
+                            json_str = json_match.group(1)
+                            try:
+                                parsed_json = json.loads(json_str)
+                                # Merge the results from this chunk into the overall results
+                                chunk_result = parsed_json.get(report_type, {})
+                                chunk_sites = chunk_result.get("Sites", {})
+                                chunk_grand_total = chunk_result.get("Grand_Total", 0)
+
+                                # Merge Sites data
+                                for site, counts in chunk_sites.items():
+                                    if site not in all_results[report_type]["Sites"]:
+                                        all_results[report_type]["Sites"][site] = {
+                                            "SW": 0,
+                                            "FW": 0,
+                                            "MEP": 0,
+                                            "Total": 0
+                                        }
+                                    all_results[report_type]["Sites"][site]["SW"] += counts.get("SW", 0)
+                                    all_results[report_type]["Sites"][site]["FW"] += counts.get("FW", 0)
+                                    all_results[report_type]["Sites"][site]["MEP"] += counts.get("MEP", 0)
+                                    all_results[report_type]["Sites"][site]["Total"] += counts.get("Total", 0)
+
+                                # Add to Grand Total
+                                all_results[report_type]["Grand_Total"] += chunk_grand_total
+
+                            except json.JSONDecodeError as e:
+                                logger.error(f"JSONDecodeError: {str(e)} - Raw response: {generated_text}")
+                                st.error(f"❌ Failed to parse JSON: {str(e)}")
+                                default_json = {report_type: {"Sites": {}, "Grand_Total": 0}}
+                                return default_json, generated_text
+                        else:
+                            logger.error("No JSON found in response")
+                            st.error("❌ No JSON found in response")
+                            default_json = {report_type: {"Sites": {}, "Grand_Total": 0}}
                             return default_json, generated_text
                     else:
-                        logger.error("No JSON found in response")
-                        st.error("❌ No JSON found in response")
-                        # Create default output format
-                        default_json = {
-                            f"{report_type}": {
-                                "Sites": {},
-                                "Grand_Total": 0
-                            }
-                        }
-                        return default_json, generated_text
+                        logger.error("Empty generated_text from WatsonX")
+                        st.error("❌ Empty response from WatsonX")
+                        return {"error": "Empty response from WatsonX"}, ""
                 else:
-                    logger.error("Empty generated_text from WatsonX")
-                    st.error("❌ Empty response from WatsonX")
-                    return {"error": "Empty response from WatsonX"}, ""
-            else:
-                error_msg = f"❌ WatsonX API error: {response.status_code} - {response.text}"
+                    error_msg = f"❌ WatsonX API error: {response.status_code} - {response.text}"
+                    st.error(error_msg)
+                    logger.error(error_msg)
+                    return {"error": error_msg}, response.text
+            except Exception as e:
+                error_msg = f"❌ Exception during WatsonX call: {str(e)}"
                 st.error(error_msg)
                 logger.error(error_msg)
-                return {"error": error_msg}, response.text
-        except Exception as e:
-            error_msg = f"❌ Exception during WatsonX call: {str(e)}"
-            st.error(error_msg)
-            logger.error(error_msg)
-            return {"error": error_msg}, ""
+                return {"error": error_msg}, ""
+
+        # Return the aggregated results
+        return all_results, json.dumps(all_results)
+
+
 
 def generate_consolidated_ncr_excel(combined_result, report_title="NCR"):
     # Create a new Excel writer
@@ -382,36 +441,34 @@ def generate_consolidated_ncr_excel(combined_result, report_title="NCR"):
         all_sites.update(open_sites.keys())
         
         # Normalize site names (some might be Tower-X, others T-X)
+        # Inside generate_consolidated_ncr_excel, update the normalization loop
         normalized_sites = {}
         for site in all_sites:
-            # Extract numeric part and normalize prefix
             match = re.search(r'(?:tower|t)[- ]?(\d+)', site, re.IGNORECASE)
             if match:
                 num = match.group(1)
-                normalized_name = f"Veridia- Tower {num.zfill(2)}"
+                normalized_name = f"Veridia- Tower {num.zfill(2)}"  # Consistent with "Tower-XX" format
                 normalized_sites[site] = normalized_name
             else:
                 normalized_sites[site] = site
-                
-        # Add a few standard sites that might not be in the data
+
+        # Add standard sites with the same format
         standard_sites = [
             "Veridia-Club",
             "Veridia- Tower 01",
             "Veridia- Tower 02",
             "Veridia- Tower 03",
-            "Veridia- Tower 04 (A)",
-            "Veridia- Tower 04 (B)",
+            "Veridia- Tower 04",
             "Veridia- Tower 05",
-            "Veridia- Tower 06", 
+            "Veridia- Tower 06",
             "Veridia- Tower 07",
             "Veridia-Commercial",
             "External Development"
         ]
-        
         for site in standard_sites:
             if site not in normalized_sites.values():
                 normalized_sites[site] = site
-        
+                
         # Sort the normalized sites
         sorted_sites = sorted(list(set(normalized_sites.values())))
         
@@ -520,7 +577,7 @@ if "session_id" in st.session_state and st.sidebar.button("Fetch Data"):
     if data:
         df = process_json_data(data)
         st.session_state["df"] = df  # Store DataFrame in session state
-        st.table(df.head(50))
+        st.dataframe(df.head(50))
         st.success("✅ Data fetched and processed successfully!")
 
 # Report Generation Section
@@ -568,3 +625,5 @@ if st.session_state["df"] is not None:
             file_name=f"NCR_Report_{month_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+
